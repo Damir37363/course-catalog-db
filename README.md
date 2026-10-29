@@ -1,6 +1,64 @@
 # course-catalog-db
 
-PostgreSQL schema for the course catalog (Lab 6, "Advanced Web Technologies").
+PostgreSQL schema for the course catalog (Lab 6, "Advanced Web Technologies"). The catalog from Labs 4 and 5 (courses, enrollments) moves from the program's memory into three tables: `courses`, `students`, `enrollments`. The FastAPI and Next.js code is not changed in this lab; the database is connected to the backend in week 7.
+
+Files: `schema.sql` (tables, keys, constraints, the index), `seed.sql` (initial data), `queries.sql` (queries for the API routes), `experiments/idx_data.sql` (many rows for the index experiment).
+
+## How to run
+
+PostgreSQL 16 or newer is required. Once, as the `postgres` superuser:
+
+```sql
+CREATE ROLE catalog_app LOGIN PASSWORD 'change-me';
+CREATE DATABASE course_catalog OWNER catalog_app;
+```
+
+Then, from the project folder (it stops at the first error):
+
+```bash
+psql -h localhost -U catalog_app -d course_catalog -v ON_ERROR_STOP=1 -f schema.sql
+psql -h localhost -U catalog_app -d course_catalog -v ON_ERROR_STOP=1 -f seed.sql
+psql -h localhost -U catalog_app -d course_catalog -v ON_ERROR_STOP=1 -f queries.sql
+```
+
+The password `change-me` is for teaching; real projects keep passwords out of git. After `schema.sql` and `seed.sql` the tables hold 6 courses, 3 students and 6 enrollments; `queries.sql` can be run any number of times (queries that change data are wrapped in `BEGIN ... ROLLBACK`).
+
+To repeat the index experiment, create a throwaway database (`CREATE DATABASE idx_demo OWNER catalog_app;`), run `schema.sql` and `experiments/idx_data.sql` in it, and drop the index (`DROP INDEX enrollments_student_id_idx;`) to see the plan "before" the index. On Windows, set `$env:PGCLIENTENCODING = "UTF8"` before starting `psql` if you insert non-English text.
+
+## Schema
+
+```mermaid
+erDiagram
+    COURSES ||--o{ ENROLLMENTS : "course enrollments"
+    STUDENTS ||--o{ ENROLLMENTS : "student enrollments"
+    COURSES {
+        text id PK "course slug"
+        text title
+        text description
+        integer credits
+        boolean is_elective
+        integer likes
+    }
+    STUDENTS {
+        bigint id PK
+        text name
+        text email UK
+    }
+    ENROLLMENTS {
+        bigint id PK
+        text course_id FK "unique together with student_id"
+        bigint student_id FK
+        timestamptz enrolled_at
+    }
+```
+
+There are three tables. `courses` and `students` are independent entities, and `enrollments` links them: each of its rows ties one student to one course through two foreign keys. The "many-to-many" relationship (a course has many students, a student takes many courses) lives in `enrollments`, which splits it into two "one-to-many" relationships, and the unique pair `(course_id, student_id)` lets a student enroll in a course only once.
+
+## Design decisions
+
+- **`courses.id` is `text` (a slug), `students.id` is an automatic number.** The slug (`modern-frontend`) is readable, already appears in the API routes and in the frontend URLs, and needs no extra lookup; its downsides are that it is longer than a number and that renaming a slug means updating every row that references it. An automatic `bigint` is short, never changes and does not depend on the data (a student's name and email can change), but it says nothing to a human, is guessable and has gaps. A course has a natural stable identifier, a student does not, so each table got the kind of key that suits it.
+- **`RESTRICT` on `enrollments.course_id`, `CASCADE` on `enrollments.student_id`.** Enrollments are the history of what people studied: deleting a course that has enrollments would silently destroy other people's records, so the database refuses (the API answers 409) and someone has to decide consciously what to do with them. An enrollment makes no sense without its student, so when a student is deleted (for example, at their request) the enrollments go with them automatically and no orphans remain.
+- **`timestamptz` and not `timestamp`; `text` and not `varchar(n)`.** `timestamptz` stores an absolute moment in time (internally in UTC) and shows it in the time zone of the session, while `timestamp` without a zone is ambiguous as soon as users or servers live in different zones or the clocks change. In PostgreSQL `text` and `varchar(n)` work equally fast, and `varchar(n)` only adds an arbitrary length limit that later breaks real data; if a length rule is needed, it is written explicitly as a `CHECK` (as with the student's name).
 
 ## Constraint violation log
 
@@ -120,3 +178,15 @@ COMMIT;
 - Without a transaction, each command would be committed by itself (autocommit). The first insert would stay in the database, the second one would fail, and we would end up with a student who has no enrollment: "half an operation", inconsistent data that someone would have to find and clean up by hand.
 
 In week 7, one API request will be one short transaction: the SQLAlchemy session opens it, and the route handler ends it with `commit()` or rolls it back on an exception. Transactions are kept short because the rows changed by an open transaction cannot be changed by anyone else.
+
+## Self-review against the checklist
+
+| What to check | Result |
+|---------------|--------|
+| Keys | Yes. Every table has a primary key (`courses.id` text, `students.id` and `enrollments.id` bigint identity), and each of the two relationships has a foreign key (`enrollments.course_id`, `enrollments.student_id`). |
+| Types | Yes. Identifiers of students and enrollments are `bigint`, the course slug is `text`, `credits` and `likes` are `integer`, the flag is `boolean`, the moment of enrollment is `timestamptz`. There is no money in this schema, so `numeric` is not needed. |
+| Required values | Yes. Every column is `NOT NULL`: each value is required by the domain, so NULL is not allowed anywhere. Defaults are set for `is_elective` (false), `likes` (0) and `enrolled_at` (now()); the ids are issued by the database. |
+| Constraints | Yes, with one gap. `CHECK`: `credits > 0`, `likes >= 0`, a student's name of at least two characters (the same rule as `Field(min_length=2)` in Pydantic); `UNIQUE`: email and the pair `(course_id, student_id)`. The gap: the format of the email is not checked in the database, only its uniqueness. |
+| Deletion | Yes. `RESTRICT` for a course with enrollments and `CASCADE` for a student's enrollments, chosen deliberately (see Design decisions) and proved by the violation log (#10, #11). |
+| Normalization | Yes. Every fact is stored once: the student's name and email only in `students`, the course's title and credits only in `courses`; `enrollments` holds only references. There are no lists of values in a single cell. |
+| Indexes and names | Yes. The foreign key `student_id` has an index (`enrollments_student_id_idx`, justified by `EXPLAIN`), `course_id` is covered by the index of the unique pair, and no unneeded indexes were added (the six-row `courses` table would not use one). Names are consistent: snake_case, plural table names, `course_id`, `<table>_<column>_idx`. |

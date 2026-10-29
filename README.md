@@ -80,3 +80,43 @@ Answers to the questions:
 1. PostgreSQL creates an index by itself only for `PRIMARY KEY` and `UNIQUE`, because it needs one to check uniqueness quickly. `email` is `UNIQUE`, and `course_id` is the first column of the unique pair `(course_id, student_id)`, so both are covered. A `FOREIGN KEY` creates no index: the database cannot know which queries you are going to run. `student_id` is only the *second* column of the pair, and a B-tree sorted by `(course_id, student_id)` does not help to find a value of the second column alone, so the search had to read the whole table.
 2. For six rows the whole table fits in one data page, and reading it sequentially (cost 1.07) is cheaper than first going through the index and then to the table. The planner compares costs, and "there is an index" does not mean "the index will be used". For 50,000 rows the sequential read costs 1042 and the index about 15, so the index wins clearly.
 3. (a) The query "one student's enrollments" (`WHERE student_id = ...`), also a `JOIN` that starts from a student. (b) The cascading delete of a student: to delete the student's enrollments, the database has to find all rows with that `student_id`, and without the index it would read the whole `enrollments` table for every deleted student.
+
+## Transaction
+
+Scenario: enroll a new student in a course — two inserts in one transaction (`INSERT INTO students ...`, then `INSERT INTO enrollments ...`).
+
+**The second insert fails** (enrollment in the nonexistent course `no-such-course`):
+
+```text
+BEGIN
+INSERT 0 1
+ERROR:  insert or update on table "enrollments" violates foreign key constraint "enrollments_course_id_fkey"
+DETAIL:  Key (course_id)=(no-such-course) is not present in table "courses".
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK
+ count
+-------
+     0
+```
+
+- The second insert failed with a foreign-key violation. The transaction was **aborted**: in an interactive psql the prompt turns into `=!>`, and every following command, even a harmless `SELECT count(*) FROM students`, is rejected with `current transaction is aborted, commands ignored until end of transaction block`. You get out of this state only with `ROLLBACK`.
+- After `ROLLBACK`, Madina is not in the database (`count = 0`): the first insert was rolled back as well, although it was correct on its own. No student without an enrollment appeared.
+
+**The successful variant, two windows** (two separate `psql` sessions, A and B):
+
+```text
+-- window A                                   -- window B
+BEGIN;
+INSERT INTO students ...      -> INSERT 0 1
+INSERT INTO enrollments ...   -> INSERT 0 1
+(not committed yet)
+                                              SELECT count(*) ... madina@example.com;  -> 0
+COMMIT;
+                                              SELECT count(*) ... madina@example.com;  -> 1
+```
+
+- Window B saw **0** (no Madina) before `COMMIT` and **1** after `COMMIT`: both rows appeared at once. Uncommitted changes are invisible to other clients; this isolation level is called `read committed` (`SHOW default_transaction_isolation` returned `read committed`, the default).
+- After the commit, the join in window A returned `Madina Ospanova | Web Security Essentials`, and the tables held 4 students and 7 enrollments (so the data differs from `seed.sql`; run `schema.sql` and `seed.sql` again for a clean state).
+- Without a transaction, each command would be committed by itself (autocommit). The first insert would stay in the database, the second one would fail, and we would end up with a student who has no enrollment: "half an operation", inconsistent data that someone would have to find and clean up by hand.
+
+In week 7, one API request will be one short transaction: the SQLAlchemy session opens it, and the route handler ends it with `commit()` or rolls it back on an exception. Transactions are kept short because the rows changed by an open transaction cannot be changed by anyone else.

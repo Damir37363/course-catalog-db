@@ -62,7 +62,7 @@ There are three tables. `courses` and `students` are independent entities, and `
 
 ## Constraint violation log
 
-Commands were run with `\set VERBOSITY verbose` on PostgreSQL 16.15, from a clean state (`schema.sql` + `seed.sql`).
+Commands were run with `\set VERBOSITY verbose` on PostgreSQL 18.6, from a clean state (`schema.sql` + `seed.sql`).
 
 | # | What we violate | SQLSTATE | Constraint | API response |
 |---|-----------------|----------|------------|--------------|
@@ -75,12 +75,13 @@ Commands were run with `\set VERBOSITY verbose` on PostgreSQL 16.15, from a clea
 | 7 | a repeated enrollment in a course | 23505 | `enrollments_course_id_student_id_key` | 409 Conflict |
 | 8 | enrolling in a nonexistent course | 23503 | `enrollments_course_id_fkey` | 404: course not found |
 | 9 | enrolling a nonexistent student | 23503 | `enrollments_student_id_fkey` | 404: student not found (422 would also work; I chose 404 because the id points to a resource that does not exist) |
-| 10 | deleting a course that has enrollments | 23503 on PostgreSQL 16 (23001 on PostgreSQL 18) | `enrollments_course_id_fkey` | 409 Conflict: a course with enrollments can't be deleted |
+| 10 | deleting a course that has enrollments | 23001 on PostgreSQL 18 (23503 on PostgreSQL 16 and 17) | `enrollments_course_id_fkey` | 409 Conflict: a course with enrollments can't be deleted |
 | 11 | deleting a student (cascade) | no error | `enrollments_student_id_fkey` (`ON DELETE CASCADE`) | not an error: the student's enrollments were deleted by cascade, 6 → 3 enrollments, and 6 again after `ROLLBACK` |
 
 Notes:
 
 - All ten commands ended with an error, and afterwards the tables still held 6 courses, 3 students and 6 enrollments: none of them changed the data.
+- The server prints the messages in the language of the system (on my Windows machine they were in Russian); the SQLSTATE codes and the constraint names are the same in any language.
 - Errors are told apart by the code class (every constraint violation starts with `23`) and by the constraint name, not by the message text: the text and even the code of experiment 10 depend on the server version.
 - The `Failing row contains (4, A, a@example.com)` line of experiment 4 shows that student number 4 was issued before the constraints were checked and is not returned to the counter after the error. A `GENERATED ALWAYS AS IDENTITY` column guarantees unique numbers, not the absence of gaps.
 - Extra check: `INSERT INTO students (id, ...) VALUES (100, ...)` fails with SQLSTATE `428C9` ("cannot insert a non-DEFAULT value into column id", the column is `GENERATED ALWAYS`). This is not a user error but a bug in the code: the API would answer 500.
@@ -91,38 +92,44 @@ Notes:
 
 Query: `SELECT * FROM enrollments WHERE student_id = 777;`
 
-Database `idx_demo` (the same schema, without the index at first): 500 courses, 20,000 students, 50,000 enrollments (`experiments/idx_data.sql`). PostgreSQL 16.15; the times depend on the computer, the plans do not.
+Database `idx_demo` (the same schema, without the index at first): 500 courses, 20,000 students, 50,000 enrollments (`experiments/idx_data.sql`). PostgreSQL 18.6; the times depend on the computer, the plans do not.
 
 | | Before the index | After the index |
 |---|------------------|-----------------|
 | Access method | `Seq Scan` on enrollments | `Bitmap Index Scan` on `enrollments_student_id_idx` + `Bitmap Heap Scan` |
 | cost | 0.00..1042.00 | 4.31..15.59 |
 | Rows Removed by Filter | 49997 | no filter: the 3 rows are found through the index |
-| Execution Time (best of three runs) | 3.018 ms (4.671 / 3.131 / 3.018) | 0.014 ms (0.053 / 0.018 / 0.014) |
+| Execution Time (best of three runs) | 4.290 ms (5.846 / 4.290 / 4.302) | 0.073 ms (0.145 / 0.073 / 0.077) |
 
-About 200 times faster. The index takes 896 kB next to the 3336 kB table (about a quarter of its size) and slows inserts, updates and deletes a little, because every change has to be reflected in the index too.
+About 60 times faster. The first run is always the slowest (the data is not in the cache yet), which is why the best of three is taken. The index takes 896 kB next to the 3336 kB table (about a quarter of its size) and slows inserts, updates and deletes a little, because every change has to be reflected in the index too.
 
-Before (`EXPLAIN ANALYZE`, third run):
+Before (`EXPLAIN ANALYZE`, the best of three runs):
 
 ```text
- Seq Scan on enrollments  (cost=0.00..1042.00 rows=3 width=34) (actual time=0.084..3.009 rows=3 loops=1)
+ Seq Scan on enrollments  (cost=0.00..1042.00 rows=3 width=34) (actual time=0.134..4.260 rows=3.00 loops=1)
    Filter: (student_id = 777)
    Rows Removed by Filter: 49997
- Planning Time: 0.034 ms
- Execution Time: 3.018 ms
+   Buffers: shared hit=417
+ Planning Time: 0.126 ms
+ Execution Time: 4.290 ms
 ```
 
-After (`CREATE INDEX enrollments_student_id_idx ON enrollments (student_id);`, `EXPLAIN ANALYZE`, third run):
+After (`CREATE INDEX enrollments_student_id_idx ON enrollments (student_id);`, `EXPLAIN ANALYZE`, the best of three runs):
 
 ```text
- Bitmap Heap Scan on enrollments  (cost=4.31..15.59 rows=3 width=34) (actual time=0.005..0.007 rows=3 loops=1)
+ Bitmap Heap Scan on enrollments  (cost=4.31..15.59 rows=3 width=34) (actual time=0.042..0.046 rows=3.00 loops=1)
    Recheck Cond: (student_id = 777)
    Heap Blocks: exact=3
-   ->  Bitmap Index Scan on enrollments_student_id_idx  (cost=0.00..4.31 rows=3 width=0) (actual time=0.003..0.003 rows=3 loops=1)
+   Buffers: shared hit=5
+   ->  Bitmap Index Scan on enrollments_student_id_idx  (cost=0.00..4.31 rows=3 width=0) (actual time=0.023..0.024 rows=3.00 loops=1)
          Index Cond: (student_id = 777)
- Planning Time: 0.023 ms
- Execution Time: 0.014 ms
+         Index Searches: 1
+         Buffers: shared hit=2
+ Planning Time: 0.138 ms
+ Execution Time: 0.073 ms
 ```
+
+The `Buffers` and `Index Searches` lines are extra output of newer PostgreSQL versions (18); the plan itself is the same. `Buffers: shared hit=417` means 417 pages were read to scan the table; the index needs 5.
 
 The other two plans from the experiment (before the index):
 
